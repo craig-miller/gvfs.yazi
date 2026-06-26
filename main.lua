@@ -52,6 +52,9 @@ local NOTIFY_MSG = {
 	PASS_INIT_GPG_ID = 'Please run "pass init <KEY_ID>" to initialize your GPG key first. \nCheck SECURE_SAVED_PASSWORD.md for the fix',
 	MISSING_PUBLIC_KEY_GPG_KEY = "GPG key is missing public key\nCheck SECURE_SAVED_PASSWORD.md for the fix",
 	AUTOMOUNT_WHEN_CD_STATE = "%s automount when cd for: %s",
+	SCANNING_LAN = "Scanning LAN for file shares...",
+	NO_LAN_SHARES = "No LAN file shares advertised",
+	SMB_SHARE_PROMPT = "Share on %s (enumeration empty; type a share name):",
 }
 
 ---@enum PASSWORD_VAULT
@@ -2087,12 +2090,201 @@ local read_hex_decoded_file_content = function(save_path)
 	return hex_decode_table(ya.json_decode(encoded_data))
 end
 
+--- Avahi service types we treat as mountable file shares, mapped to the
+--- gvfs scheme prefix used in the resulting URI.
+local AVAHI_FILE_SHARE_TYPES = {
+	["_smb._tcp"] = "smb",
+	["_afpovertcp._tcp"] = "afp",
+	["_sftp-ssh._tcp"] = "sftp",
+	["_webdav._tcp"] = "dav",
+	["_webdavs._tcp"] = "davs",
+}
+
+--- Percent-encode a string for use as a single URI path segment.
+---@param s string
+---@return string
+local function url_encode_segment(s)
+	return (s:gsub("[^%w._~%-]", function(c)
+		return string.format("%%%02X", c:byte())
+	end))
+end
+
+--- Decode avahi-browse's decimal escape sequences (e.g. "Macintosh\032HD"
+--- → "Macintosh HD"). avahi --parsable emits \DDD for any byte outside the
+--- printable ASCII range or any of `; \`.
+---@param s string
+---@return string
+local function avahi_decimal_unescape(s)
+	return (s:gsub("\\(%d%d%d)", function(d)
+		return string.char(tonumber(d))
+	end))
+end
+
+--- Browse the local network via mDNS/DNS-SD for advertised file shares.
+--- Returns a sorted, deduped list of `{name, scheme, host}` services. The
+--- avahi-browse subprocess blocks for a few seconds while it resolves;
+--- callers should notify the user first.
+---@return table[]
+local function avahi_browse_file_shares()
+	local _, output = run_command("avahi-browse", {
+		"-art",
+		"--parsable",
+		"--no-db-lookup",
+	})
+	if not output or not output.stdout then
+		return {}
+	end
+
+	local seen = {}
+	local services = {}
+	for line in output.stdout:gmatch("[^\r\n]+") do
+		-- "=;<iface>;<proto>;<name>;<type>;<domain>;<host>;<ip>;<port>;<txt>"
+		local fields = {}
+		for f in (line .. ";"):gmatch("([^;]*);") do
+			fields[#fields + 1] = f
+		end
+		local scheme = AVAHI_FILE_SHARE_TYPES[fields[5] or ""]
+		if fields[1] == "=" and scheme then
+			local name = avahi_decimal_unescape(fields[4] or "")
+			local host = avahi_decimal_unescape(fields[7] or "")
+			local key = scheme .. "\0" .. host
+			if name ~= "" and host ~= "" and not seen[key] then
+				seen[key] = true
+				services[#services + 1] = {
+					name = name,
+					scheme = scheme,
+					host = host,
+				}
+			end
+		end
+	end
+	table.sort(services, function(a, b)
+		if a.scheme ~= b.scheme then
+			return a.scheme < b.scheme
+		end
+		return a.name < b.name
+	end)
+	return services
+end
+
+--- Enumerate SMB shares on `host` via `gio list smb://host/`. Best-effort:
+--- silent auth failures, hosts that block anonymous enumeration, or
+--- gvfsd-smb-browse running without a tty callback all return {}. Filters
+--- administrative shares (trailing `$`) and gio error lines.
+---@param host string
+---@return string[]
+local function gio_list_smb_shares(host)
+	local _, output = run_command("gio", { "list", "smb://" .. host .. "/" })
+	if not output or not output.stdout then
+		return {}
+	end
+
+	local shares = {}
+	for line in output.stdout:gmatch("[^\r\n]+") do
+		if
+			line ~= ""
+			and not line:match("%$$")
+			and not line:match("^gio:")
+			and not line:match("^Error")
+			and not line:match("^Operation")
+		then
+			shares[#shares + 1] = line
+		end
+	end
+	return shares
+end
+
+--- Pick a value from `values` using ya.which, with `desc_fn(value, index)`
+--- producing each candidate's description. Uses the same key alphabet as
+--- select_device_which_key. Returns the picked value or nil on cancel.
+---@generic T
+---@param values T[]
+---@param desc_fn fun(v: T, i: integer): string
+---@return T?
+local function pick_from_list_with_which(values, desc_fn)
+	local which_keys = get_state(STATE_KEY.WHICH_KEYS)
+		or "1234567890qwertyuiopasdfghjklzxcvbnm-=[]\\;',./!@#$%^&*()_+{}|:\"<>?"
+	local allow_key_array = string_to_array(which_keys)
+	local cands = {}
+	for idx, v in ipairs(values) do
+		if idx > #allow_key_array then
+			break
+		end
+		cands[#cands + 1] = {
+			on = tostring(allow_key_array[idx]),
+			desc = desc_fn(v, idx),
+		}
+	end
+	if #cands == 0 then
+		return nil
+	end
+	local selected_idx = ya.which({ cands = cands })
+	if selected_idx and selected_idx > 0 then
+		return values[selected_idx]
+	end
+	return nil
+end
+
+--- Discover a mount URI by browsing the LAN.
+--- 1. avahi-browse → list of file-share services (notify the user first
+---    because the resolve pass blocks for ~3s).
+--- 2. ya.which over discovered services.
+--- 3. For SMB: gio list smb://host/ → ya.which over share names, or
+---    ya.input fallback if enumeration is empty (silent auth failure on
+---    macOS Tahoe, hosts that block anon enum, smb-browse with no tty).
+--- 4. For AFP / SFTP / DAV / DAVS: bare-host URI; gvfs prompts at mount.
+---@return string?
+local function browse_network_for_uri()
+	info(NOTIFY_MSG.SCANNING_LAN)
+	local services = avahi_browse_file_shares()
+	if #services == 0 then
+		info(NOTIFY_MSG.NO_LAN_SHARES)
+		return nil
+	end
+
+	local svc = pick_from_list_with_which(services, function(s)
+		return s.name .. " (" .. s.scheme .. ")"
+	end)
+	if not svc then
+		return nil
+	end
+
+	if svc.scheme == "smb" then
+		local shares = gio_list_smb_shares(svc.host)
+		local share
+		if #shares > 0 then
+			share = pick_from_list_with_which(shares, function(s)
+				return s
+			end)
+		else
+			share, _ = show_input(
+				string.format(NOTIFY_MSG.SMB_SHARE_PROMPT, svc.host),
+				false,
+				""
+			)
+			if share then
+				share = share:gsub("^%s*(.-)%s*$", "%1")
+			end
+		end
+		if not share or share == "" then
+			return nil
+		end
+		return "smb://" .. svc.host .. "/" .. url_encode_segment(share)
+	end
+
+	return svc.scheme .. "://" .. svc.host .. "/"
+end
+
 ---@param is_edit boolean?
-local function add_or_edit_mount_action(is_edit)
+---@param prefill_uri string?
+local function add_or_edit_mount_action(is_edit, prefill_uri)
 	---@type any
 	local mount = {
 		is_manually_added = true,
 	}
+	if prefill_uri then
+		mount.uri = prefill_uri
+	end
 
 	local selected_idx = nil
 
@@ -2190,6 +2382,27 @@ local function add_or_edit_mount_action(is_edit)
 	end
 	set_state(STATE_KEY.MOUNTS, mounts)
 	save_mounts()
+end
+
+--- Wrap add_or_edit_mount_action's add path: first ask the user whether to
+--- discover a URI via avahi or type one manually, then delegate. The edit
+--- path is untouched and goes straight to add_or_edit_mount_action(true).
+local function add_or_edit_mount_action_with_browse()
+	local source = ya.which({
+		cands = {
+			{ on = "b", desc = "Browse network (Avahi)" },
+			{ on = "u", desc = "Type URI manually" },
+		},
+	})
+	if source == 1 then
+		local uri = browse_network_for_uri()
+		if not uri then
+			return
+		end
+		add_or_edit_mount_action(false, uri)
+	elseif source == 2 then
+		add_or_edit_mount_action()
+	end
 end
 
 local function load_gdrive_folder_action()
@@ -2483,7 +2696,7 @@ function M:entry(job)
 	elseif action == ACTION.JUMP_BACK_PREV_CWD then
 		jump_to_prev_cwd_action()
 	elseif action == ACTION.ADD_MOUNT then
-		add_or_edit_mount_action()
+		add_or_edit_mount_action_with_browse()
 	elseif action == ACTION.EDIT_MOUNT then
 		add_or_edit_mount_action(true)
 	elseif action == ACTION.REMOVE_MOUNT then
