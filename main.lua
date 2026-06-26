@@ -54,6 +54,8 @@ local NOTIFY_MSG = {
 	AUTOMOUNT_WHEN_CD_STATE = "%s automount when cd for: %s",
 	SCANNING_LAN = "Scanning LAN for file shares...",
 	NO_LAN_SHARES = "No LAN file shares advertised",
+	SCAN_FAILED = "LAN scan failed: %s",
+	SHARE_ENUM_FAILED = "Couldn't enumerate shares on %s: %s",
 	SMB_SHARE_PROMPT = "Share on %s (enumeration empty; type a share name):",
 }
 
@@ -2121,23 +2123,30 @@ local function avahi_decimal_unescape(s)
 end
 
 --- Browse the local network via mDNS/DNS-SD for advertised file shares.
---- Returns a sorted, deduped list of `{name, scheme, host}` services. The
---- avahi-browse subprocess blocks for a few seconds while it resolves;
---- callers should notify the user first.
----@return table[]
+--- Returns `(services, err)`. On success `services` is a sorted, deduped
+--- list of `{name, scheme, host}` (possibly empty if the LAN advertises
+--- none) and `err` is nil. On failure `services` is nil and `err` carries
+--- a short string suitable for an error toast. The avahi-browse subprocess
+--- blocks for a few seconds while it resolves; callers should notify the
+--- user first.
+---@return table[]?, string?
 local function avahi_browse_file_shares()
-	local _, output = run_command("avahi-browse", {
+	local cmd_err, output = run_command("avahi-browse", {
 		"-art",
 		"--parsable",
 		"--no-db-lookup",
 	})
-	if not output or not output.stdout then
-		return {}
+	if cmd_err or not output then
+		return nil, "couldn't spawn avahi-browse"
+	end
+	if not output.status or not output.status.success then
+		local stderr = (output.stderr or ""):gsub("[\r\n]+$", "")
+		return nil, stderr ~= "" and stderr or "avahi-browse exited non-zero"
 	end
 
 	local seen = {}
 	local services = {}
-	for line in output.stdout:gmatch("[^\r\n]+") do
+	for line in (output.stdout or ""):gmatch("[^\r\n]+") do
 		-- "=;<iface>;<proto>;<name>;<type>;<domain>;<host>;<ip>;<port>;<txt>"
 		local fields = {}
 		for f in (line .. ";"):gmatch("([^;]*);") do
@@ -2167,20 +2176,22 @@ local function avahi_browse_file_shares()
 	return services
 end
 
---- Enumerate SMB shares on `host` via `gio list smb://host/`. Best-effort:
---- silent auth failures, hosts that block anonymous enumeration, or
---- gvfsd-smb-browse running without a tty callback all return {}. Filters
---- administrative shares (trailing `$`) and gio error lines.
+--- Enumerate SMB shares on `host` via `gio list smb://host/`. Returns
+--- `(shares, err)`. On hard failure (gio binary missing, spawn error) err
+--- is set. On soft failure (gio runs, exits non-zero, host blocks anon
+--- enum, smb-browse with no tty callback) shares is an empty table and
+--- err is nil — callers should fall through to typed input.
+--- Filters administrative shares (trailing `$`) and gio error lines.
 ---@param host string
----@return string[]
+---@return string[]?, string?
 local function gio_list_smb_shares(host)
-	local _, output = run_command("gio", { "list", "smb://" .. host .. "/" })
-	if not output or not output.stdout then
-		return {}
+	local cmd_err, output = run_command("gio", { "list", "smb://" .. host .. "/" })
+	if cmd_err or not output then
+		return nil, "couldn't spawn gio"
 	end
 
 	local shares = {}
-	for line in output.stdout:gmatch("[^\r\n]+") do
+	for line in (output.stdout or ""):gmatch("[^\r\n]+") do
 		if
 			line ~= ""
 			and not line:match("%$$")
@@ -2191,7 +2202,7 @@ local function gio_list_smb_shares(host)
 			shares[#shares + 1] = line
 		end
 	end
-	return shares
+	return shares, nil
 end
 
 --- Pick a value from `values` using ya.which, with `desc_fn(value, index)`
@@ -2236,7 +2247,11 @@ end
 ---@return string?
 local function browse_network_for_uri()
 	info(NOTIFY_MSG.SCANNING_LAN)
-	local services = avahi_browse_file_shares()
+	local services, scan_err = avahi_browse_file_shares()
+	if scan_err then
+		error(NOTIFY_MSG.SCAN_FAILED, scan_err)
+		return nil
+	end
 	if #services == 0 then
 		info(NOTIFY_MSG.NO_LAN_SHARES)
 		return nil
@@ -2250,7 +2265,11 @@ local function browse_network_for_uri()
 	end
 
 	if svc.scheme == "smb" then
-		local shares = gio_list_smb_shares(svc.host)
+		local shares, share_err = gio_list_smb_shares(svc.host)
+		if share_err then
+			error(NOTIFY_MSG.SHARE_ENUM_FAILED, svc.host, share_err)
+			return nil
+		end
 		local share
 		if #shares > 0 then
 			share = pick_from_list_with_which(shares, function(s)
