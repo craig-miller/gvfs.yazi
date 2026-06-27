@@ -1,4 +1,16 @@
-# gvfs.yazi
+# gvfs.yazi (craig-miller fork)
+
+> **This is a fork of [boydaihungst/gvfs.yazi](https://github.com/boydaihungst/gvfs.yazi).**
+> It carries one addition on top of upstream: the `add-mount` action now opens
+> a two-key prompt ("Browse network" / "Type URI"). The Browse path uses
+> `avahi-browse` to discover LAN file shares (SMB / AFP / SFTP / DAV / DAVS),
+> presents them via `ya.which`, and for SMB additionally enumerates shares
+> via `gio list` (falling through to a typed share-name input when
+> enumeration is empty). Everything else is upstream verbatim — same setup
+> options, same other actions, same supported schemes. An upstream PR may
+> follow; until then, use this fork directly via `ya pkg add craig-miller/gvfs`.
+
+---
 
 <!-- toc -->
 
